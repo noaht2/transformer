@@ -197,9 +197,8 @@ class Transformer:
         
         return p
     
-    def dropout(self, x: np.ndarray) -> np.ndarray:
-        check(x)
-        return x
+    def dropout(self, x: np.ndarray, p: float = 0.9) -> np.ndarray:
+        return x*np.random.default_rng().choice([0, 1], size=x.shape, p=[1-p, p])
 
     def layernorm(self, x: np.ndarray, i: int) -> None:
         self.seminormed[i] = x-np.mean(x, -1, keepdims=True)
