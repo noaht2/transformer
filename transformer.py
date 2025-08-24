@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+import numbers
+import typing
+
 import numpy as np
 
 import numpy.typing as npt
@@ -8,18 +11,18 @@ from scipy.special import softmax
 from scipy.stats import norm, truncnorm
 
 
-def gelu(x):
+def gelu(x: npt.ArrayLike) -> npt.ArrayLike:
     return x*norm.cdf(x)
 
 
-def gelu_prime(x):
+def gelu_prime(x: npt.ArrayLike) -> npt.ArrayLike:
     return x*norm.pdf(x) + norm.cdf(x)
 
 
 def it(x: np.ndarray) -> np.ndarray:
     # inner transpose
     assert len(x.shape) == 3
-    return np.transpose(x, (0, 2, 1))
+    return x.transpose(0, 2, 1)
 
 
 def diag2(x: np.ndarray) -> np.ndarray:
@@ -37,13 +40,14 @@ def check(*xs: np.ndarray) -> None:
 
 class Transformer:
     def __init__(self,
-                 n_vocab: int,
+                 n_vocab: typing.SupportsIndex,
                  d_k: int,
-                 d_mlp: int,
-                 n_blocks: int,
+                 d_v: int,
+                 d_mlp: typing.SupportsIndex,
+                 n_blocks: typing.SupportsIndex,
                  n_heads: int,
                  max_length: int,
-                 epsilon):
+                 epsilon: float):
         self.max_length = max_length
         self.epsilon = epsilon
 
@@ -51,6 +55,7 @@ class Transformer:
         self.n_blocks = n_blocks
 
         self.d_k = d_k
+        self.d_v = d_v
         self.d_mlp = d_mlp
 
         self.n_heads = n_heads
@@ -88,10 +93,19 @@ class Transformer:
                                    self.n_blocks,
                                    self.n_heads,
                                    self.d_embed,
-                                   self.d_embed))
+                                   self.d_v))
         self.b_v = np.nan*np.ones((self.n_flavours,
                                    self.n_blocks,
                                    self.n_heads,
+                                   1,
+                                   self.d_v))
+
+        self.w_o = np.nan*np.ones((self.n_flavours,
+                                   self.n_blocks,
+                                   self.n_heads*self.d_v,
+                                   self.d_embed))
+        self.b_o = np.nan*np.ones((self.n_flavours,
+                                   self.n_blocks,
                                    1,
                                    self.d_embed))
 
@@ -121,6 +135,7 @@ class Transformer:
                         self.w_q,
                         self.w_k,
                         self.w_v,
+                        self.w_o,
                         self.w_up,
                         self.w_down]
 
@@ -128,6 +143,7 @@ class Transformer:
                        self.b_q,
                        self.b_k,
                        self.b_v,
+                       self.b_o,
                        self.b_up,
                        self.b_down]
 
@@ -157,6 +173,10 @@ class Transformer:
     @property
     def d_embed(self) -> int:
         return self.n_heads*self.d_k
+
+    @property
+    def d_stack(self) -> int:
+        return self.n_heads*self.d_v
     
     def positional_encoding(self, n: int) -> npt.NDArray[np.floating]:
         c = self.max_length
@@ -177,17 +197,17 @@ class Transformer:
         
         return p
     
-    def dropout(self, x: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    def dropout(self, x: np.ndarray) -> np.ndarray:
         check(x)
         return x
 
-    def layernorm(self, x: npt.NDArray[np.floating], i: int) -> None:
+    def layernorm(self, x: np.ndarray, i: int) -> None:
         self.seminormed[i] = x-np.mean(x, -1, keepdims=True)
         adjusted_std = np.sqrt(np.var(x, -1, keepdims=True)+self.epsilon)
         self.normed[i] = self.seminormed[i]/adjusted_std
         self.renormed[i] = self.gamma[0, i]*self.normed[i] + self.beta[0, i]
 
-    def d_layernorm(self, i):
+    def d_layernorm(self, i: int) -> npt.NDArray[np.floating]:
         from_gamma = np.diag(self.gamma[0, i].reshape((self.d_embed,)))
         
         k = -(1/self.d_embed)*(self.seminormed[i, :, :, np.newaxis]@self.seminormed[i, :, np.newaxis])
@@ -198,12 +218,12 @@ class Transformer:
         
         return from_gamma@from_std@from_mean
 
-    def mask(self, ps: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    def mask(self, ps: np.ndarray) -> npt.NDArray[np.floating]:
         # works on one or many grids
 
         return ps - np.triu(np.inf*np.ones_like(ps), k=1)
 
-    def multiheaded_selfattention(self, x: npt.NDArray[np.floating], i: int) -> npt.NDArray[np.floating]:
+    def multiheaded_selfattention(self, x: np.ndarray, i: int) -> npt.NDArray[np.floating]:
         check(x)
         
         self.pre_attention[i] = np.repeat([x], self.n_heads, 0)
@@ -225,15 +245,17 @@ class Transformer:
         self.adjusted_patterns[i] = self.dropout(softmax(self.masked_patterns[i], axis=2))
         grids = self.adjusted_patterns[i]@self.values[i]
 
-        return np.sum(grids, 0)/self.n_heads
+        self.stack[i] = grids.transpose(1, 0, 2).reshape((self.n, self.d_stack))
 
-    def attention_subblock(self, x: npt.NDArray[np.floating], i: int) -> npt.NDArray[np.floating]:
+        return self.stack[i]@self.w_o[0, i] + self.b_o[0, i]
+
+    def attention_subblock(self, x: np.ndarray, i: int) -> npt.NDArray[np.floating]:
         raw = x
         self.layernorm(x, 2*i)
         results = self.multiheaded_selfattention(self.renormed[2*i], i)
         return self.dropout(results) + raw
 
-    def mlp_subblock(self, x: npt.NDArray[np.floating], i: int) -> npt.NDArray[np.floating]:
+    def mlp_subblock(self, x: np.ndarray, i: int) -> npt.NDArray[np.floating]:
         self.layernorm(x, 2*i+1)
         self.pre_mlp[i] = self.renormed[2*i+1]
         self.pre_gelu[i] = self.pre_mlp[i]@self.w_up[0, i] + self.b_up[0, i]
@@ -241,11 +263,11 @@ class Transformer:
         a = self.post_gelu[i]@self.w_down[0, i] + self.b_down[0, i]
         return self.dropout(a) + self.pre_mlp[i]
 
-    def block(self, x: npt.NDArray[np.floating], i: int) -> npt.NDArray[np.floating]:
+    def block(self, x: np.ndarray, i: int) -> npt.NDArray[np.floating]:
         self.post_attention[i] = self.attention_subblock(x, i)
         return self.mlp_subblock(self.post_attention[i], i)
 
-    def apply(self, x: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    def apply(self, x: np.ndarray) -> npt.NDArray[np.floating]:
         self.x = x
         n = self.n = len(x)
         
@@ -263,10 +285,11 @@ class Transformer:
         self.pre_attention = np.nan*np.ones((self.n_blocks, self.n_heads, n, self.d_embed))
         self.queries = np.nan*np.ones((self.n_blocks, self.n_heads, n, self.d_k))
         self.keys = np.nan*np.ones((self.n_blocks, self.n_heads, n, self.d_k))
-        self.values = np.nan*np.ones((self.n_blocks, self.n_heads, n, self.d_embed))
+        self.values = np.nan*np.ones((self.n_blocks, self.n_heads, n, self.d_v))
         self.masked_patterns = np.nan*np.ones((self.n_blocks, self.n_heads, n, n))
         self.patterns = np.nan*np.ones((self.n_blocks, self.n_heads, n, n))
         self.adjusted_patterns = np.nan*np.ones((self.n_blocks, self.n_heads, n, n))
+        self.stack = np.nan*np.ones((self.n_blocks, n, self.d_stack))
         self.post_attention = np.nan*np.ones((self.n_blocks, n, self.d_embed))
         
         self.z[0] = self.dropout(embeddings)
@@ -282,7 +305,7 @@ class Transformer:
 
         return self.probs
 
-    def backprop(self, data: npt.NDArray[np.floating]) -> None:
+    def backprop(self, data: np.ndarray) -> None:
         x = data[:-1]
         y = data[1:]
         n = len(x)
@@ -308,7 +331,9 @@ class Transformer:
         self.beta[1, :-1] = 0
         self.gamma[1, :-1] = 0
 
-        self.w_v[1] = np.zeros((self.n_blocks, self.n_heads, self.d_embed, self.d_embed))
+        self.w_o[1] = 0
+        self.b_o[1] = 0
+        self.w_v[1] = np.zeros((self.n_blocks, self.n_heads, self.d_embed, self.d_v))
         self.b_v[1] = 0
         self.w_k[1] = np.zeros((self.n_blocks, self.n_heads, self.d_embed, self.d_k))
         self.b_k[1] = 0
@@ -326,6 +351,8 @@ class Transformer:
         u2 = np.nan*np.ones((n, 1, self.d_embed))
         u4 = np.nan*np.ones((n, 1, self.d_embed))
         u3 = np.nan*np.ones((n, 1, self.d_embed))
+        u7 = np.nan*np.ones((n, 1, self.d_stack))
+        u8 = np.nan*np.ones((n, self.n_heads, 1, self.d_v))
 
         for l in range(self.n_blocks-1, -1, -1):
             for i in range(n):
@@ -352,16 +379,22 @@ class Transformer:
                 # print(u3[i].shape, u2[i].shape, self.d_layernorm(2*l+1).shape)
                 u4[i] = u2[i]@self.d_layernorm(2*l+1)[i]
 
-                u3[i] = u4[i]/self.n_heads
+                u3[i] = u4[i]
 
-                self.w_v[1, l] += it(self.adjusted_patterns[l, :, np.newaxis, i]@self.pre_attention[l])@u3[i]
-                self.b_v[1, l] += np.sum(it(self.adjusted_patterns[l, :, np.newaxis, i])@u3[i], axis=1, keepdims=True)
+                self.w_o[1, l] += self.stack[l, i, :, np.newaxis]@u3[i]
+                self.b_o[1, l] += u3[i]
 
-                self.w_k[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l])@m@s[l, :, i]@self.values[l]@u3[i].T@self.queries[l, :, i, np.newaxis]
-                self.b_k[1, l] += np.sum((1/np.sqrt(self.d_k))*m@s[l, :, i]@self.values[l]@u3[i].T@self.queries[l, :, i, np.newaxis], axis=1, keepdims=True)
+                u7[i] = u3[i]@self.w_o[0, l].T
+                u8[i] = u7[i].reshape((self.n_heads, 1, self.d_v))
+
+                self.w_v[1, l] += it(self.adjusted_patterns[l, :, np.newaxis, i]@self.pre_attention[l])@u8[i]
+                self.b_v[1, l] += np.sum(it(self.adjusted_patterns[l, :, np.newaxis, i])@u8[i], axis=1, keepdims=True)
+
+                self.w_k[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l])@m@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis]
+                self.b_k[1, l] += np.sum((1/np.sqrt(self.d_k))*m@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis], axis=1, keepdims=True)
                 
-                self.w_q[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l, :, i, np.newaxis])@u3[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
-                self.b_q[1, l] += (1/np.sqrt(self.d_k))*u3[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
+                self.w_q[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l, :, i, np.newaxis])@u8[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
+                self.b_q[1, l] += (1/np.sqrt(self.d_k))*u8[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
                 
                 for j in range(n):
                     inner = np.zeros((self.n_heads, n, self.d_embed))
@@ -373,7 +406,7 @@ class Transformer:
                     inner /= np.sqrt(self.d_k)
 
                     r = self.adjusted_patterns[l, :, i, np.newaxis, j, np.newaxis]*np.eye(self.d_embed)
-                    self.through_attention[i, j] = u3[i]@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + r) + it(self.b_v[0, l].repeat(self.n, axis=1))@inner)
+                    self.through_attention[i, j] = u8[i]@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + r) + it(self.b_v[0, l].repeat(self.n, axis=1))@inner)
                         
                     # self.through_attention[i, j] = u3[i]@it(self.w_v[0, l])@(self.adjusted_patterns[l, :, i, j, np.newaxis, np.newaxis]*np.eye(self.d_embed))
                     # # print(self.through_attention[i, j])
@@ -411,7 +444,7 @@ class Transformer:
         for i in range(n):
             self.w_embedding[1] += self.x[i, :, np.newaxis]@u0[i]
 
-    def train(self, data, runs) -> None:
+    def train(self, data: np.ndarray, runs: numbers.Integral) -> None:
         beta_1 = 0.9
         beta_2 = 0.999
         epsilon = 0.000001
