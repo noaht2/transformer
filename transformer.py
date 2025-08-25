@@ -48,6 +48,8 @@ class Transformer:
                  n_heads: int,
                  max_length: int,
                  epsilon: float):
+        self.training = False
+        
         self.max_length = max_length
         self.epsilon = epsilon
 
@@ -198,7 +200,10 @@ class Transformer:
         return p
     
     def dropout(self, x: np.ndarray, p: float = 0.9) -> np.ndarray:
-        return x*np.random.default_rng().choice([0, 1], size=x.shape, p=[1-p, p])
+        if self.training:
+            return x*np.random.default_rng().choice([0, 1], size=x.shape, p=[1-p, p])
+        else:
+            return (1-p)*x
 
     def layernorm(self, x: np.ndarray, i: int) -> None:
         self.seminormed[i] = x-np.mean(x, -1, keepdims=True)
@@ -444,6 +449,8 @@ class Transformer:
             self.w_embedding[1] += self.x[i, :, np.newaxis]@u0[i]
 
     def train(self, data: np.ndarray, runs: numbers.Integral) -> None:
+        self.training = True
+        
         beta_1 = 0.9
         beta_2 = 0.999
         epsilon = 0.000001
@@ -451,8 +458,12 @@ class Transformer:
 
         def nll():
             return -np.mean(np.log(np.sum(self.probs*data[0, 1:], axis=1)))
+            
 
         def c(p, *args, **kwargs):
+            t = self.training
+            self.training = False
+            
             check(p[0], p[1])
             epsilon = 0.01 + 0.001/(np.linalg.norm(p[1]))
             # print(epsilon)
@@ -464,6 +475,8 @@ class Transformer:
             # print(x, y)
             print(x-y, *args, **kwargs)  # should be positive
             p[0] += epsilon*p[1]
+
+            self.training = t
         """
         self.apply(data[0, :-1])
         print(self.probs)
@@ -535,6 +548,8 @@ class Transformer:
                 print(t)
                 print(nll())
 
+        self.training = False
+                
         self.apply(data[0, :-1])
         print(self.probs)
         print()
