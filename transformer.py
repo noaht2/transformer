@@ -11,18 +11,18 @@ from scipy.special import softmax
 from scipy.stats import norm, truncnorm
 
 
-def gelu(x: npt.ArrayLike) -> npt.ArrayLike:
+def gelu(x: npt.ArrayLike) -> np.ndarray:
     return x*norm.cdf(x)
 
 
-def gelu_prime(x: npt.ArrayLike) -> npt.ArrayLike:
+def gelu_prime(x: npt.ArrayLike) -> np.ndarray:
     return x*norm.pdf(x) + norm.cdf(x)
 
 
 def it(x: np.ndarray) -> np.ndarray:
     # inner transpose
-    assert len(x.shape) == 3
-    return x.transpose(0, 2, 1)
+    assert len(x.shape) >= 2
+    return x.swapaxes(-1, -2)
 
 
 def diag2(x: np.ndarray) -> np.ndarray:
@@ -354,99 +354,243 @@ class Transformer:
         u1 = np.nan*np.ones((n, 1, self.d_mlp))
         u2 = np.nan*np.ones((n, 1, self.d_embed))
         u4 = np.nan*np.ones((n, 1, self.d_embed))
-        u3 = np.nan*np.ones((n, 1, self.d_embed))
+        # u3 = np.nan*np.ones((n, 1, self.d_embed))
         u7 = np.nan*np.ones((n, 1, self.d_stack))
         u8 = np.nan*np.ones((n, self.n_heads, 1, self.d_v))
 
-        for l in range(self.n_blocks-1, -1, -1):
-            for i in range(n):
-                m = np.eye(n)
-                m[(i+1):, :] = 0
-                
-                s = np.nan*np.ones((self.n_blocks, self.n_heads, n, n, n))
-                s[l, :, i] = -self.adjusted_patterns[l, :, i, :, np.newaxis]@self.adjusted_patterns[l, :, np.newaxis, i]
-                s[l, :, i] += self.adjusted_patterns[l, :, i, :, np.newaxis]*np.eye(n)
-                
-                self.b_down[1, l] += u0[i]
-                self.w_down[1, l] += self.post_gelu[l, i, np.newaxis].T@u0[i]
-
-                u1[i] = u0[i]@self.w_down[0, l].T@np.diag(gelu_prime(self.pre_gelu[l, i]))
-
-                self.b_up[1, l] += u1[i]
-                self.w_up[1, l] += self.pre_mlp[l, i, np.newaxis].T@u1[i]
-
-                u2[i] = u1[i]@self.w_up[0, l].T + u0[i]
-
-                self.beta[1, 2*l+1] += u2[i]
-                self.gamma[1, 2*l+1] += u2[i]*self.normed[2*l+1, i, np.newaxis]
-
-                # print(u3[i].shape, u2[i].shape, self.d_layernorm(2*l+1).shape)
-                u4[i] = u2[i]@self.d_layernorm(2*l+1)[i]
-
-                u3[i] = u4[i]
-
-                self.w_o[1, l] += self.stack[l, i, :, np.newaxis]@u3[i]
-                self.b_o[1, l] += u3[i]
-
-                u7[i] = u3[i]@self.w_o[0, l].T
-                u8[i] = u7[i].reshape((self.n_heads, 1, self.d_v))
-
-                self.w_v[1, l] += it(self.adjusted_patterns[l, :, np.newaxis, i]@self.pre_attention[l])@u8[i]
-                self.b_v[1, l] += np.sum(it(self.adjusted_patterns[l, :, np.newaxis, i])@u8[i], axis=1, keepdims=True)
-
-                self.w_k[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l])@m@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis]
-                self.b_k[1, l] += np.sum((1/np.sqrt(self.d_k))*m@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis], axis=1, keepdims=True)
-                
-                self.w_q[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l, :, i, np.newaxis])@u8[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
-                self.b_q[1, l] += (1/np.sqrt(self.d_k))*u8[i]@it(self.values[l])@s[l, :, i]@m.T@self.keys[l]
-                
-                for j in range(n):
-                    inner = np.zeros((self.n_heads, n, self.d_embed))
-                    if i == j:
-                        inner[:, :, :] = self.keys[l]@it(self.w_q[0, l])
-                    inner[:, j, np.newaxis] += self.queries[l, :, i, np.newaxis]@it(self.w_k[0, l])
-
-                    inner = s[l, :, i]@m@inner
-                    inner /= np.sqrt(self.d_k)
-
-                    r = self.adjusted_patterns[l, :, i, np.newaxis, j, np.newaxis]*np.eye(self.d_embed)
-                    self.through_attention[i, j] = u8[i]@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + r) + it(self.b_v[0, l].repeat(self.n, axis=1))@inner)
-                        
-                    # self.through_attention[i, j] = u3[i]@it(self.w_v[0, l])@(self.adjusted_patterns[l, :, i, j, np.newaxis, np.newaxis]*np.eye(self.d_embed))
-                    # # print(self.through_attention[i, j])
-                    # if i == j:
-                    #     w = self.pre_attention[l]
-                    #     a = self.w_k[0, l]@it(self.w_q[0, l])
-                    #     r = w[:, i, np.newaxis]@it(a)
-                    #     x = w@a
-                    #     x[:, i, np.newaxis] += r
-                    #     x += self.b_k[0, l].repeat(n, axis=1)@it(self.w_q[0, l])
-                    # else:
-                    #     r = self.pre_attention[l, :, i, np.newaxis]@self.w_q[0, l]@it(self.w_k[0, l])
-                    #     x = np.zeros((self.n_heads, n, self.d_embed))
-                    #     x[:, j, np.newaxis] = r
-                    #     # print(x.shape)
-                    # x[:, j, np.newaxis] += self.b_q[0, l]@it(self.w_k[0, l])
-                    # x /= np.sqrt(self.d_k)
-                    # y = s[l, :, i, np.newaxis, j]@m.T
-                    # z = y@x
-                    # self.through_attention[i, j] += u3[i]@it(self.w_v[0, l])@z.repeat(self.d_embed, axis=1)
-                    # self.through_attention[i, j] += u3[i]@it(self.b_v[0, l]).repeat(n, axis=2)@s[l, :, i]@m.T@x
-
-            u5 = self.through_attention.sum(axis=(0, 2))
-
-            for i in range(n):
-                self.beta[1, 2*l] += u5[i]
-                self.gamma[1, 2*l] += u5[i]*self.normed[2*l, i, np.newaxis]
-
-            u6 = u5@self.d_layernorm(2*l)
-
-            u0 = u6+u4
-            check(u0, u1, u2, u3, u5, u6)
-            check(self.through_attention)
+        m = np.repeat([np.eye(n)], n, axis=0)
 
         for i in range(n):
-            self.w_embedding[1] += self.x[i, :, np.newaxis]@u0[i]
+            m[i, (i+1):, :] = 0
+
+        s = -self.adjusted_patterns.reshape((self.n_blocks, self.n_heads, n, n, 1))@self.adjusted_patterns.reshape((self.n_blocks, self.n_heads, n, 1, n)) + self.adjusted_patterns.reshape((self.n_blocks, self.n_heads, n, 1, n))*np.eye(n)
+
+        fancy_mask = np.zeros((n, self.n_heads, n, self.d_embed))
+        for j in range(n):
+            fancy_mask[j, :, j, :] = 1
+
+        for l in range(self.n_blocks-1, -1, -1):
+            p = True
+
+            if p:
+                self.b_down[1, l] = u0.sum(axis=0)
+                self.w_down[1, l] = np.sum(self.post_gelu[l].reshape((n, self.d_mlp, 1))@u0, axis=0)
+
+                u1 = u0@self.w_down[0, l].T*gelu_prime(self.pre_gelu[l]).reshape((n, 1, self.d_mlp))
+
+                self.b_up[1, l] = u1.sum(axis=0)
+                self.w_up[1, l] = np.sum(self.pre_mlp[l].reshape((n, self.d_embed, 1))@u1, axis=0)
+                
+                u2 = u1@self.w_up[0, l].T + u0
+
+                self.beta[1, 2*l+1] = u2.sum(axis=0)
+                self.gamma[1, 2*l+1] = np.sum(u2*self.normed[2*l+1, :, np.newaxis], axis=0)
+
+                u4 = u2@self.d_layernorm(2*l+1)
+
+                self.b_o[1, l] = u4.sum(axis=0)
+                self.w_o[1, l] = np.sum(self.stack[l].reshape((n, self.d_stack, 1))@u4, axis=0)
+
+                # print(u7.shape, "\t", u4.shape, self.w_o[0, l].shape)
+                u7 = u4@self.w_o[0, l].T
+
+                u8 = u7.reshape((n, self.n_heads, 1, self.d_v))
+                # print(u8.shape)
+
+                # i = 0
+                # it(self.pre_attention[l])@it(self.adjusted_patterns[l, :, np.newaxis, i])@u8[i]
+                self.w_v[1, l] = np.sum(it(self.pre_attention[l])@self.adjusted_patterns[l].reshape((self.n_heads, n, n, 1)).transpose(1, 0, 2, 3)@u8, axis=0)
+                self.b_v[1, l] = np.sum(self.adjusted_patterns[l].reshape((self.n_heads, n, n, 1)).transpose(1, 0, 2, 3)@u8, axis=(0, 2), keepdims=False).reshape(self.b_v[1, l].shape)
+
+                self.w_k[1, l] = np.sum((1/np.sqrt(self.d_k))*it(self.pre_attention[l])@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@s[l].swapaxes(0, 1)@self.values[l]@it(u8)@np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k)), axis=0)
+                self.b_k[1, l] = np.sum(1/np.sqrt(self.d_k)*np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@(s[l]).swapaxes(0, 1)@self.values[l]@it(u8)@np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k)), axis=(0, 2)).reshape((self.n_heads, 1, self.d_k))
+
+                self.w_q[1, l] = np.sum(1/np.sqrt(self.d_k)*self.pre_attention[l].swapaxes(0, 1).reshape((n, self.n_heads, self.d_embed, 1))@u8@it(self.values[l])@s[l].swapaxes(0, 1)@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@self.keys[l], axis=0)
+                self.b_q[1, l] = np.sum(1/np.sqrt(self.d_k)*u8@it(self.values[l])@s[l].swapaxes(0, 1)@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@self.keys[l], axis=0)
+
+                inner_0 = np.zeros((n, n, self.n_heads, n, self.d_embed))
+
+                inner_0[np.diag_indices(n)] += self.keys[l]@it(self.w_q[0, l])
+
+                inner_0 += fancy_mask*np.broadcast_to(self.queries[l]@it(self.w_k[0, l]), (n, n, self.n_heads, n, self.d_embed)).swapaxes(0, 3)
+
+                inner_1 = np.broadcast_to(m, (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@inner_0
+                inner = np.broadcast_to(s[l], (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@inner_1
+                inner /= np.sqrt(self.d_k)
+
+                gr = self.adjusted_patterns[l].transpose(1, 2, 0).reshape((n, n, self.n_heads, 1, 1))*np.eye(self.d_embed)
+                hr = np.broadcast_to(it(self.b_v[0, l]), (self.n_heads, self.d_v, n))
+                self.through_attention = np.broadcast_to(u8, (n, n, self.n_heads, 1, self.d_v)).swapaxes(0, 1)@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + gr) + hr@inner)
+
+                # inner = np.zeros((n, n, self.n_heads, n, self.d_embed))
+
+                # # print(inner.shape, (self.queries[l]@it(self.w_k[0, l])).shape)
+                # # print(inner.shape, "\t", self.queries[l].shape, it(self.w_k[0, l]).shape)
+                # # print(inner.shape, "\t", self.queries[l].reshape((self.n_heads, n, 1, self.d_k)).swapaxes(0, 1).reshape((n, 1, self.n_heads, 1, self.d_k)).shape, it(self.w_k[0, l]).shape)
+                # inner[:, :, :, :, :] = self.queries[l].reshape((self.n_heads, n, 1, self.d_k)).swapaxes(0, 1).reshape((n, 1, self.n_heads, 1, self.d_k))@it(self.w_k[0, l])
+                
+                # inner[np.diag_indices(n)] += self.keys[l]@it(self.w_q[0, l])
+
+                # inner = np.broadcast_to(m, (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@inner
+                # inner = np.broadcast_to(s[l], (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@inner
+                # inner /= np.sqrt(self.d_k)
+
+                # gr = self.adjusted_patterns[l].transpose(1, 2, 0).reshape((n, n, self.n_heads, 1, 1))*np.eye(self.d_embed)
+                # hr = np.broadcast_to(it(self.b_v[0, l]), (self.n_heads, self.d_v, n))
+                # self.through_attention = np.broadcast_to(u8, (n, n, self.n_heads, 1, self.d_v)).swapaxes(0, 1)@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + gr) + hr@inner)
+                # # print((it(self.pre_attention[l])@inner).shape, gr.shape)
+                # # print(u8.shape, it(self.w_v[0, l]).shape, it(self.pre_attention[l]).shape, inner.shape)
+                # # print(self.through_attention.shape, fr.shape)
+            
+            if not p:
+                for i in range(n):
+                    self.b_down[1, l] += u0[i]
+                    self.w_down[1, l] += self.post_gelu[l, i, np.newaxis].T@u0[i]
+
+                    u1[i] = u0[i]@self.w_down[0, l].T@np.diag(gelu_prime(self.pre_gelu[l, i]))
+                    u1[i] = u0[i]@self.w_down[0, l].T*gelu_prime(self.pre_gelu[l, i])
+
+                    self.b_up[1, l] += u1[i]
+                    self.w_up[1, l] += self.pre_mlp[l, i, np.newaxis].T@u1[i]
+
+                    u2[i] = u1[i]@self.w_up[0, l].T + u0[i]
+
+                    self.beta[1, 2*l+1] += u2[i]
+                    self.gamma[1, 2*l+1] += u2[i]*self.normed[2*l+1, i, np.newaxis]
+
+                    u4[i] = u2[i]@self.d_layernorm(2*l+1)[i]
+
+                    self.b_o[1, l] += u4[i]
+                    self.w_o[1, l] += self.stack[l, i, :, np.newaxis]@u4[i]
+
+                    u7[i] = u4[i]@self.w_o[0, l].T
+                    u8[i] = u7[i].reshape((self.n_heads, 1, self.d_v))
+
+                    # print(self.adjusted_patterns[l].shape, self.adjusted_patterns[l, :, np.newaxis, i].shape, it(self.adjusted_patterns[l, :, np.newaxis, i]).shape)
+                    # print(self.w_v[1, l].shape, "\t", it(self.pre_attention[l]).shape, it(self.adjusted_patterns[l, :, np.newaxis, i]).shape, u8[i].shape)
+                    self.w_v[1, l] += it(self.pre_attention[l])@it(self.adjusted_patterns[l, :, np.newaxis, i])@u8[i]
+                    self.b_v[1, l] += np.sum(it(self.adjusted_patterns[l, :, np.newaxis, i])@u8[i], axis=1, keepdims=True)
+
+                    # print((it(self.pre_attention[l])@m[i]@s[l, :, i]@self.values[l]@it(u8[i])).shape, self.queries[l, :, i, np.newaxis].shape, "\t", self.queries[l].shape)
+                    self.w_k[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l])@m[i]@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis]
+                    self.b_k[1, l] += (1/np.sqrt(self.d_k))*np.sum(m[i]@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis], axis=1, keepdims=True)
+
+                    # print(it(self.pre_attention[l, :, i, np.newaxis]).shape, u8[i].shape)
+                    self.w_q[1, l] += (1/np.sqrt(self.d_k))*it(self.pre_attention[l, :, i, np.newaxis])@u8[i]@it(self.values[l])@s[l, :, i]@m[i].T@self.keys[l]
+                    self.b_q[1, l] += (1/np.sqrt(self.d_k))*u8[i]@it(self.values[l])@s[l, :, i]@m[i].T@self.keys[l]
+
+                    # print(np.all(
+                    
+                    for j in range(n):
+                        inner = np.zeros((self.n_heads, n, self.d_embed))
+                        if i == j:
+                            inner[:, :, :] = self.keys[l]@it(self.w_q[0, l])
+                        inner[:, j, np.newaxis] += self.queries[l, :, i, np.newaxis]@it(self.w_k[0, l])
+
+                        inner = s[l, :, i]@m[i]@inner
+                        inner /= np.sqrt(self.d_k)
+
+                        r = self.adjusted_patterns[l, :, i, np.newaxis, j, np.newaxis]*np.eye(self.d_embed)
+                        self.through_attention[i, j] = u8[i]@(it(self.w_v[0, l])@(it(self.pre_attention[l])@inner + r) + np.broadcast_to(it(self.b_v[0, l]), (self.n_heads, self.d_v, n))@inner)
+                        check(self.through_attention[i, j])
+
+                            # print((i, j), np.max(np.abs((self.through_attention[i, j] - fr[i, j])/(self.through_attention[i, j]+1e-10))))
+                            
+
+                assert (np.all(self.b_down[1, l] == u0.sum(axis=0)))
+                assert (np.all(self.w_down[1, l] == np.sum(self.post_gelu[l].reshape((n, self.d_mlp, 1))@u0, axis=0)))
+
+                assert np.all(u1 == u0@self.w_down[0, l].T*gelu_prime(self.pre_gelu[l]).reshape((n, 1, self.d_mlp)))
+                
+                assert (np.all(self.b_up[1, l] == u1.sum(axis=0)))
+                assert (np.all(self.w_up[1, l] == np.sum(self.pre_mlp[l].reshape((n, self.d_embed, 1))@u1, axis=0)))
+
+                assert np.all(u2 == u1@self.w_up[0, l].T + u0)
+                
+                assert (np.all(self.beta[1, 2*l+1] == u2.sum(axis=0)))
+                assert (np.all(self.gamma[1, 2*l+1] == np.sum(u2*self.normed[2*l+1, :, np.newaxis], axis=0)))
+
+                assert np.all(u4 == u2@self.d_layernorm(2*l+1))
+                
+                assert (np.all(self.b_o[1, l] == u4.sum(axis=0)))
+                assert (np.all(self.w_o[1, l] == np.sum(self.stack[l].reshape((n, self.d_stack, 1))@u4, axis=0)))
+
+                assert np.all(u7 == u4@self.w_o[0, l].T)
+
+                assert np.all(u8 == u7.reshape((n, self.n_heads, 1, self.d_v)))
+
+                # print(self.w_v[1, l].shape, "\t", it(self.pre_attention[l]).shape, self.adjusted_patterns[l].reshape((self.n_heads, n, n, 1)).swapaxes(0, 1).shape, u8.shape)
+
+                np.testing.assert_array_equal(np.sum(it(self.pre_attention[l])@self.adjusted_patterns[l].reshape((self.n_heads, n, n, 1)).transpose(1, 0, 2, 3)@u8, axis=0), self.w_v[1, l])
+
+                np.testing.assert_array_equal(np.sum((1/np.sqrt(self.d_k))*it(self.pre_attention[l])@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@s[l].swapaxes(0, 1)@self.values[l]@it(u8)@np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k)), axis=0), self.w_k[1, l])
+
+                (1/np.sqrt(self.d_k))*np.sum(m[i]@s[l, :, i]@self.values[l]@it(u8[i])@self.queries[l, :, i, np.newaxis], axis=1, keepdims=True)
+
+                # print(m[i].shape, "", s[l, :, i].shape, self.values[l].shape, it(u8[i]).shape, self.queries[l, :, i, np.newaxis].shape, sep="\t")
+                # print(np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1).shape, (s[l]).swapaxes(0, 1).shape, self.values[l].shape, it(u8).shape, np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k)).shape, sep="\t")
+                # print(((1/np.sqrt(self.d_k))*np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@(s[l]).swapaxes(0, 1)@self.values[l]@it(u8)@np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k))).shape)
+                
+                # np.testing.assert_array_equal(np.sum((1/np.sqrt(self.d_k))*np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@(s[l]).swapaxes(0, 1)@self.values[l]@it(u8)@np.reshape(self.queries[l].swapaxes(0, 1), (n, self.n_heads, 1, self.d_k)), axis=(0, 2)).reshape((self.n_heads, 1, self.d_k)), self.b_k[1, l])
+
+                assert (np.all(self.w_q[1, l] == np.sum(1/np.sqrt(self.d_k)*self.pre_attention[l].swapaxes(0, 1).reshape((n, self.n_heads, self.d_embed, 1))@u8@it(self.values[l])@s[l].swapaxes(0, 1)@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@self.keys[l], axis=0)))
+                assert (np.all(self.b_q[1, l] == np.sum(1/np.sqrt(self.d_k)*u8@it(self.values[l])@s[l].swapaxes(0, 1)@np.broadcast_to(m, (self.n_heads, n, n, n)).swapaxes(0, 1)@self.keys[l], axis=0)))
+
+                t_inner_0 = np.zeros((n, n, self.n_heads, n, self.d_embed))
+
+                t_inner_1 = np.copy(t_inner_0)
+                t_inner_1[np.diag_indices(n)] += self.keys[l]@it(self.w_q[0, l])
+                
+                fancy_mask = np.zeros((n, self.n_heads, n, self.d_embed))
+                for j in range(n):
+                    fancy_mask[j, :, j, :] = 1
+
+                t_sob = fancy_mask*np.broadcast_to(self.queries[l]@it(self.w_k[0, l]), (n, n, self.n_heads, n, self.d_embed)).swapaxes(0, 3)
+                    
+                t_inner_2 = t_inner_1+t_sob  # self.queries[l].reshape((self.n_heads, n, 1, self.d_k)).swapaxes(0, 1).reshape((n, 1, self.n_heads, 1, self.d_k))@it(self.w_k[0, l])#
+
+                t_inner = np.broadcast_to(m, (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@t_inner_2
+                t_inner = np.broadcast_to(s[l], (n, self.n_heads, n, n, n)).transpose(2, 0, 1, 3, 4)@t_inner
+                t_inner /= np.sqrt(self.d_k)
+
+                t_gr = self.adjusted_patterns[l].transpose(1, 2, 0).reshape((n, n, self.n_heads, 1, 1))*np.eye(self.d_embed)
+                t_hr = np.broadcast_to(it(self.b_v[0, l]), (self.n_heads, self.d_v, n))
+                t_through_attention = np.broadcast_to(u8, (n, n, self.n_heads, 1, self.d_v)).swapaxes(0, 1)@(it(self.w_v[0, l])@(it(self.pre_attention[l])@t_inner + t_gr) + t_hr@t_inner)
+                
+                for i in range(n):
+                    for j in range(n):
+                        inner = np.zeros((self.n_heads, n, self.d_embed))
+                        if i == j:
+                            inner[:, :, :] = self.keys[l]@it(self.w_q[0, l])
+                        np.testing.assert_array_equal(t_inner_1[i, j], inner)
+                        # print(inner[:, j, np.newaxis].shape, "\t", self.queries[l, :, i, np.newaxis].shape, it(self.w_k[0, l]).shape)
+                        inner[:, j, np.newaxis] += self.queries[l, :, i, np.newaxis]@it(self.w_k[0, l])  # jj !!!
+
+                        # np.testing.assert_array_equal(t_inner_2[i, j], inner)
+
+                        inner = s[l, :, i]@m[i]@inner
+                        inner /= np.sqrt(self.d_k)
+
+                        # np.testing.assert_array_equal(t_inner[i, j], inner)
+
+                # np.testing.assert_array_equal(t_through_attention, self.through_attention)
+
+            check(self.through_attention)
+            u5 = self.through_attention.sum(axis=(0, 2))
+            check(u5)
+
+            self.beta[1, 2*l] = u5.sum(axis=0)
+            self.gamma[1, 2*l] = np.sum(u5*self.normed[2*l].reshape((n, 1, self.d_embed)), axis=0)
+
+            u6 = u5@self.d_layernorm(2*l)
+            check(u6)
+
+            u0 = u6+u4
+            check(u0)
+            check(u1)
+            check(u4)
+
+        self.w_embedding[1] = np.sum(x[:, :, np.newaxis]@u0, axis=0)
 
     def train(self, data: np.ndarray, runs: numbers.Integral) -> None:
         self.training = True
@@ -477,42 +621,13 @@ class Transformer:
             p[0] += epsilon*p[1]
 
             self.training = t
-        """
-        self.apply(data[0, :-1])
-        print(self.probs)
-
-        self.backprop(data[0])
-
-        c(self.b_unembedding)
-        c(self.w_unembedding)
-        
-        c(self.beta[:, -1])
-        c(self.gamma[:, -1])
-        
-        c(self.b_down[:, -1])
-        c(self.w_down[:, -1])
-        c(self.b_up[:, -1])
-        c(self.w_up[:, -1])
-
-        c(self.beta[:, -2])
-        c(self.gamma[:, -2])
-
-        c(self.b_v[:, -1])
-        c(self.w_v[:, -1])
-
-        print()
-        c(self.b_k[:, -1])
-        c(self.w_k[:, -1])
-        c(self.b_q[:, -1])
-        c(self.w_q[:, -1])
-        """
         # exit()
 
         for t in range(1, runs+1):
                 
             self.backprop(data[0])
 
-            if (t % (runs//10)) == 0:
+            if runs < 10 or t % (runs//10) == 0 or t % 10 == 0:
                 ...
                 # print()
                 # c(self.w_unembedding)
@@ -543,7 +658,7 @@ class Transformer:
                 check(p[0])
                 # p[0] -= rho*p[1]
 
-            if (t % (runs//10)) == 0:
+            if runs < 10 or (t % (runs//10)) == 0:
                 # print()
                 print(t)
                 print(nll())
